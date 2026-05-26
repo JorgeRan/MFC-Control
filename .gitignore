@@ -1,0 +1,23 @@
+.DS_Store
+.vite/
+
+# Frontend build/runtime artifacts
+app/node_modules/
+app/dist/
+
+# Backend Python environments and caches
+mass-flow-controller/.venv/
+mass-flow-controller/env/
+mass-flow-controller/__pycache__/
+mass-flow-controller/.pytest_cache/
+
+# Generated runtime data
+mass-flow-controller/data/*.csv
+mass-flow-controller/data/*.log
+mass-flow-controller/zeroed.flag
+mass-flow-controller/session_state.json
+
+# Editor / OS noise
+*.swp
+*.swo
+Thumbs.db

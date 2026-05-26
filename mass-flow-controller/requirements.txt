@@ -1,0 +1,11 @@
+gpsd-py3==0.3.0
+bronkhorst-propar==1.2.0
+pynmea2==1.19.0
+pyserial==3.5
+fastapi==0.105.0
+uvicorn==0.24.0
+python-socketio==5.10.0
+python-engineio==4.8.0
+aiofiles==23.2.1
+httpx==0.25.2
+gpiozero==2.0.1
