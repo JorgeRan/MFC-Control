@@ -10,6 +10,43 @@ export function CommandSection({
   const [setpointValue, setSetpointValue] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const getDeviceButtonClasses = (deviceId) => {
+    const palette = [
+      {
+        write: "bg-blue-500 hover:bg-blue-600 focus:ring-blue-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+      {
+        write: "bg-emerald-500 hover:bg-emerald-600 focus:ring-emerald-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+      {
+        write: "bg-violet-500 hover:bg-violet-600 focus:ring-violet-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+      {
+        write: "bg-amber-500 hover:bg-amber-600 focus:ring-amber-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+      {
+        write: "bg-cyan-500 hover:bg-cyan-600 focus:ring-cyan-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+      {
+        write: "bg-fuchsia-500 hover:bg-fuchsia-600 focus:ring-fuchsia-500",
+        off: "bg-red-500 hover:bg-red-600 focus:ring-red-500",
+      },
+    ];
+
+    if (typeof deviceId !== "string") return palette[0];
+    const match = /^dev_(\d+)$/i.exec(deviceId.trim());
+    const idx = match ? Number.parseInt(match[1], 10) - 1 : 0;
+    if (!Number.isInteger(idx) || idx < 0) return palette[0];
+    return palette[idx % palette.length];
+  };
+
+  const deviceButtonClasses = getDeviceButtonClasses(activeDeviceId);
+
   const handleCommand = async (command) => {
     try {
       setLoading(true);
@@ -75,7 +112,7 @@ export function CommandSection({
             disabled={loading || !sessionActive}
             className={`
             inline-flex items-center px-4 py-2 
-            ${sessionActive && activeDeviceId == "dev_01" ? "bg-blue-500 hover:bg-blue-600" : sessionActive && activeDeviceId == "dev_02" ? "bg-emerald-500 hover:bg-emerald-600" : ""} text-white text-sm font-medium rounded-full
+            ${sessionActive ? deviceButtonClasses.write : ""} text-white text-sm font-medium rounded-full
             transition-colors shadow-sm
             hover:shadow
 
@@ -95,7 +132,7 @@ export function CommandSection({
             disabled={loading || !sessionActive}
             className={`
             inline-flex items-center px-4 py-2 
-            ${sessionActive && activeDeviceId == "dev_01" ? "bg-red-500 hover:bg-red-600" : sessionActive && activeDeviceId == "dev_02" ? "bg-red-500 hover:bg-red-600" : ""} text-white text-sm font-medium rounded-full
+            ${sessionActive ? deviceButtonClasses.off : ""} text-white text-sm font-medium rounded-full
             transition-colors shadow-sm
             hover:shadow
 
@@ -120,7 +157,7 @@ export function CommandSection({
           disabled={loading}
           className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 disabled:bg-emerald-300 text-white text-sm font-medium rounded-lg transition-colors"
         >
-          Turn ON
+            ${sessionActive ? "bg-red-500 hover:bg-red-600" : ""} text-white text-sm font-medium rounded-full
         </button>
         <button
           onClick={() => handleCommand("off")}

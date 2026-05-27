@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 const METRICS_FALLBACK_INTERVAL_MS = 30000;
+const MAX_MFC_DEVICES = 6;
 
 export function StatusCards({    
   metrics,
@@ -40,15 +41,16 @@ export function StatusCards({
   });
 
   const deviceToMfcId = (id) => {
-    if (id === "dev_01") return 0; // MFC-BL
-    if (id === "dev_02") return 1; // MFC-BK
-    return null;
+    const match = /^dev_(\d+)$/i.exec(String(id || "").trim());
+    if (!match) return null;
+    const idx = Number.parseInt(match[1], 10) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= MAX_MFC_DEVICES) return null;
+    return idx;
   };
 
-  const mfcIdToDevice = {
-      0: "dev_01",
-      1: "dev_02",
-    };
+  const mfcIdToDevice = Object.fromEntries(
+    Array.from({ length: MAX_MFC_DEVICES }, (_, idx) => [idx, `dev_${String(idx + 1).padStart(2, "0")}`]),
+  );
 
   useEffect(() => {
     
@@ -153,8 +155,10 @@ export function StatusCards({
                     ...prev,
                     [activeDeviceId]: {
                       ...(prev[activeDeviceId] || {}),
-                      flow: newPoint[`flow_mfc${uplinkMfc}`],
-                      setpoint: newPoint[`setpoint_mfc${uplinkMfc}`],
+                      flow: Number.isFinite(flow) ? flow : prev[activeDeviceId]?.flow ?? 0,
+                      setpoint: Number.isFinite(setpoint)
+                        ? setpoint
+                        : prev[activeDeviceId]?.setpoint ?? 0,
                     },
                   }));
               }
@@ -217,12 +221,20 @@ export function StatusCards({
                   if (onDataUpdate) onDataUpdate(next);
                   if (onMetricsUpdate) {
                     const cur = deviceToMfcId(activeDeviceId);
+                    const flowKey = `flow_mfc${cur}`;
+                    const setpointKey = `setpoint_mfc${cur}`;
                     onMetricsUpdate((prev) => ({
                       ...prev,
                       [activeDeviceId]: {
                         ...(prev[activeDeviceId] || {}),
-                        flow: newPoint[`flow_mfc${cur}`],
-                        setpoint: newPoint[`setpoint_mfc${cur}`],
+                        flow:
+                          cur !== null && Object.prototype.hasOwnProperty.call(newPoint, flowKey)
+                            ? newPoint[flowKey]
+                            : prev[activeDeviceId]?.flow ?? 0,
+                        setpoint:
+                          cur !== null && Object.prototype.hasOwnProperty.call(newPoint, setpointKey)
+                            ? newPoint[setpointKey]
+                            : prev[activeDeviceId]?.setpoint ?? 0,
                       },
                     }));
                   }

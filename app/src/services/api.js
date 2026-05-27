@@ -14,9 +14,11 @@ const API_BASE_URL = (() => {
 
 
 function deviceIdToMfcId(deviceId) {
-  if (deviceId === "dev_01") return 0;
-  if (deviceId === "dev_02") return 1;
-  return null;
+  const match = /^dev_(\d+)$/i.exec(String(deviceId || "").trim());
+  if (!match) return null;
+  const idx = Number.parseInt(match[1], 10) - 1;
+  if (!Number.isInteger(idx) || idx < 0 || idx > 5) return null;
+  return idx;
 }
 
 
@@ -205,7 +207,7 @@ export async function fetchDeviceLogs(deviceId) {
 
 /**
  * Send a command to a device
- * @param {string} deviceId - Device ID (dev_01 or dev_02)
+ * @param {string} deviceId - Device ID (dev_01 ... dev_06)
  * @param {string} command - Command: 'on', 'off', or 'toggle'
  */
 export async function sendCommand(deviceId, command) {
@@ -214,7 +216,7 @@ export async function sendCommand(deviceId, command) {
     if (mfcId === null) {
       throw new Error("Invalid device ID");
     }
-    const endpoint = mfcId === 0 ? "/send-command-0" : "/send-command-1";
+    const endpoint = `/send-command-${mfcId}`;
 
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: "POST",
@@ -237,7 +239,7 @@ export async function sendCommand(deviceId, command) {
 
 /**
  * Set setpoint value for a device
- * @param {string} deviceId - Device ID (dev_01 or dev_02)
+ * @param {string} deviceId - Device ID (dev_01 ... dev_06)
  * @param {number} value - Setpoint value in LN/min
  */
 export async function setSetpoint(deviceId, value) {
@@ -246,7 +248,7 @@ export async function setSetpoint(deviceId, value) {
     if (mfcId === null) {
       throw new Error("Invalid device ID");
     }
-    const endpoint = mfcId === 0 ? "/setpoint-0" : "/setpoint-1";
+    const endpoint = `/setpoint-${mfcId}`;
 
     console.log(
       `[setSetpoint] Device: ${deviceId}, Endpoint: ${endpoint}, Value: ${value}`,

@@ -3,6 +3,7 @@ import sys
 import json
 import os
 import csv
+from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from calibration_loader import CalibrationLoader, Calibration
@@ -67,13 +68,39 @@ gps_coordinates_logged = False
 calibration_loader = None
 last_status_row_by_node = {}
 csv_slot_keys = []
-CSV_MFC_SLOT_COUNT = 2
+last_csv_block_by_slot = {}
+CSV_INITIAL_MFC_SLOT_COUNT = 2
 CSV_TIMESTAMP_COLUMN_COUNT = 2
 CSV_BLOCK_WIDTH = 9
 timezone_finder = TimezoneFinder()
 latched_timezone_name = None
 latched_gps_coords = None
 timezone_latched_logged = False
+
+
+def _other_process_has_cmd_fragment(fragment: str) -> bool:
+    current_pid = os.getpid()
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return False
+
+    for pid_dir in proc_dir.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        pid = int(pid_dir.name)
+        if pid == current_pid:
+            continue
+        cmdline_path = pid_dir / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        cmdline = raw.replace(b"\x00", b" ").decode(errors="ignore")
+        if fragment in cmdline:
+            return True
+    return False
 
 
 def get_calibration_loader() -> CalibrationLoader:
@@ -124,22 +151,40 @@ def csv_row_sort_key(row):
 def csv_row_slot_key(row):
     return (
         normalize_serial(str(row.get("serial", ""))).strip().upper(),
-        str(row.get("id", "")).strip().upper(),
         str(row.get("address", "")).strip().upper(),
     )
 
 
 def csv_slot_key_from_columns(row, offset):
     serial = row[offset + 1].strip() if len(row) > offset + 1 else ""
-    mfc_id = row[offset + 0].strip() if len(row) > offset + 0 else ""
     address = row[offset + 2].strip() if len(row) > offset + 2 else ""
-    if not any((serial, mfc_id, address)):
+    if not any((serial, address)):
         return None
     return (
         normalize_serial(serial).strip().upper(),
-        mfc_id.strip().upper(),
         address.strip().upper(),
     )
+
+
+def load_last_csv_data_row(csv_path: str):
+    if not os.path.exists(csv_path):
+        return None
+
+    last_data_row = None
+    try:
+        with open(csv_path, "r", newline="") as infile:
+            reader = csv.reader(infile)
+            for row in reader:
+                if not row:
+                    continue
+                first_cell = row[0].strip()
+                if first_cell in ("Timestamp UTC", "GPS Coordinates"):
+                    continue
+                last_data_row = row
+    except Exception:
+        return None
+
+    return last_data_row
 
 
 def load_csv_slot_keys(csv_path: str):
@@ -164,14 +209,54 @@ def load_csv_slot_keys(csv_path: str):
         return []
 
     loaded_keys = []
-    for offset in (
-        CSV_TIMESTAMP_COLUMN_COUNT,
-        CSV_TIMESTAMP_COLUMN_COUNT + CSV_BLOCK_WIDTH,
-    ):
+    max_offset = max(CSV_TIMESTAMP_COLUMN_COUNT, len(last_data_row))
+    for offset in range(CSV_TIMESTAMP_COLUMN_COUNT, max_offset, CSV_BLOCK_WIDTH):
         slot_key = csv_slot_key_from_columns(last_data_row, offset)
         if slot_key is not None:
             loaded_keys.append(slot_key)
-    return loaded_keys[:CSV_MFC_SLOT_COUNT]
+    return loaded_keys
+
+
+def ensure_csv_slot_capacity(csv_path: str, slot_count: int):
+    """Expand an existing CSV file to the requested number of MFC blocks."""
+    if not os.path.exists(csv_path):
+        return
+
+    target_slot_count = max(CSV_INITIAL_MFC_SLOT_COUNT, int(slot_count or 0))
+    target_width = CSV_TIMESTAMP_COLUMN_COUNT + (target_slot_count * CSV_BLOCK_WIDTH)
+
+    with open(csv_path, "r", newline="") as infile:
+        rows = list(csv.reader(infile))
+
+    if not rows:
+        return
+
+    current_width = max((len(row) for row in rows), default=0)
+    if current_width >= target_width:
+        return
+
+    mfc_block_header = [
+        "MFC Id",
+        "Serial",
+        "Address",
+        "Gas",
+        "Setpoint",
+        "Flow",
+        "Raw Setpoint",
+        "Raw Flow",
+        "Calibration",
+    ]
+
+    rows[0] = ["Timestamp UTC", "Timestamp Local"] + (mfc_block_header * target_slot_count)
+
+    for row_index in range(1, len(rows)):
+        padding = target_width - len(rows[row_index])
+        if padding > 0:
+            rows[row_index].extend([""] * padding)
+
+    with open(csv_path, "w", newline="") as outfile:
+        writer = csv.writer(outfile)
+        writer.writerows(rows)
 
 
 def format_csv_timestamp(dt: datetime) -> str:
@@ -248,7 +333,7 @@ def insert_gps_row_after_header(csv_path: str, latitude: float, longitude: float
 
 
 def append_status_rows_to_csv(timestamp_utc: str, timestamp_local: str, node_rows, gps_coords=None):
-    global gps_coordinates_logged, csv_slot_keys
+    global gps_coordinates_logged, csv_slot_keys, last_csv_block_by_slot
 
     mfc_block_header = [
         "MFC Id",
@@ -269,8 +354,19 @@ def append_status_rows_to_csv(timestamp_utc: str, timestamp_local: str, node_row
 
     if not file_exists:
         csv_slot_keys = []
+        last_csv_block_by_slot = {}
     elif not csv_slot_keys:
         csv_slot_keys = load_csv_slot_keys(CSV_LOG_FILE)
+
+    if file_exists and csv_slot_keys and not last_csv_block_by_slot:
+        last_data_row = load_last_csv_data_row(CSV_LOG_FILE)
+        if last_data_row:
+            for slot_index, slot_key in enumerate(csv_slot_keys):
+                offset = CSV_TIMESTAMP_COLUMN_COUNT + (slot_index * CSV_BLOCK_WIDTH)
+                padded = list(last_data_row) + [""] * max(0, (offset + CSV_BLOCK_WIDTH) - len(last_data_row))
+                block = padded[offset : offset + CSV_BLOCK_WIDTH]
+                if any(cell not in (None, "") for cell in block):
+                    last_csv_block_by_slot[slot_key] = block
 
     gps_row = None
     if not gps_coordinates_logged:
@@ -283,20 +379,35 @@ def append_status_rows_to_csv(timestamp_utc: str, timestamp_local: str, node_row
                 gps_row = ["GPS Coordinates", f"{latitude:.8f}", f"{longitude:.8f}"]
             gps_coordinates_logged = True
 
-    with open(CSV_LOG_FILE, "a", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        if not file_exists:
+    if node_rows:
+        for row in sorted(node_rows, key=csv_row_sort_key):
+            slot_key = csv_row_slot_key(row)
+            if slot_key in csv_slot_keys:
+                continue
+            csv_slot_keys.append(slot_key)
+
+    target_slot_count = max(CSV_INITIAL_MFC_SLOT_COUNT, len(csv_slot_keys))
+
+    if not file_exists:
+        with open(CSV_LOG_FILE, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
             writer.writerow([
                 "Timestamp UTC",
                 "Timestamp Local",
             ] + mfc_block_header + mfc_block_header)
             if gps_row is not None:
                 writer.writerow(gps_row)
+        file_exists = True
 
-        if not node_rows:
-            return
+    ensure_csv_slot_capacity(CSV_LOG_FILE, target_slot_count)
 
-        def row_to_block(row):
+    if not node_rows:
+        return
+
+    with open(CSV_LOG_FILE, "a", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+
+        def row_to_block(row, slot_key):
             if row is None:
                 return ["", "", "", "", "", "", "", "", ""]
             return [
@@ -311,20 +422,30 @@ def append_status_rows_to_csv(timestamp_utc: str, timestamp_local: str, node_row
                 row.get("calibration_status"),
             ]
 
+        def fill_missing_from_last(slot_key, block):
+            last_block = last_csv_block_by_slot.get(slot_key)
+            if last_block is None:
+                return ["" if value is None else value for value in block]
+            merged = []
+            for idx, value in enumerate(block):
+                if value in (None, ""):
+                    merged.append(last_block[idx])
+                else:
+                    merged.append(value)
+            return merged
+
         rows_by_key = {csv_row_slot_key(row): row for row in node_rows}
 
-        for row in sorted(node_rows, key=csv_row_sort_key):
-            slot_key = csv_row_slot_key(row)
-            if slot_key in csv_slot_keys:
-                continue
-            if len(csv_slot_keys) >= CSV_MFC_SLOT_COUNT:
-                break
-            csv_slot_keys.append(slot_key)
+        blocks = []
+        for slot_index in range(target_slot_count):
+            slot_key = csv_slot_keys[slot_index] if slot_index < len(csv_slot_keys) else None
+            raw_block = row_to_block(rows_by_key.get(slot_key) if slot_key is not None else None, slot_key)
+            block = fill_missing_from_last(slot_key, raw_block)
+            if slot_key is not None and any(cell not in (None, "") for cell in block):
+                last_csv_block_by_slot[slot_key] = list(block)
+            blocks.extend(block)
 
-        left = rows_by_key.get(csv_slot_keys[0]) if len(csv_slot_keys) > 0 else None
-        right = rows_by_key.get(csv_slot_keys[1]) if len(csv_slot_keys) > 1 else None
-
-        writer.writerow([timestamp_utc, timestamp_local] + row_to_block(left) + row_to_block(right))
+        writer.writerow([timestamp_utc, timestamp_local] + blocks)
 
 
 
@@ -608,6 +729,14 @@ def publish_status(ser, nodes, log_csv=False):
 
 def main():
     nodes = []
+
+    # Avoid dual-writer logging. API server now owns CSV logging.
+    if _other_process_has_cmd_fragment("api_server.py"):
+        print(
+            "INFO: api_server.py is running; refusing to start legacy mfc_status_publisher logger",
+            flush=True,
+        )
+        return
 
     try:
         ser = get_serial()

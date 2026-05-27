@@ -14,6 +14,7 @@ import { TrendingUp } from "lucide-react";
 import { connectWebSocket, fetchDeviceMetrics } from "../services/api";
 
 const METRICS_FALLBACK_INTERVAL_MS = 30000;
+const MAX_MFC_DEVICES = 6;
 
 export function FlowChart({
   deviceId,
@@ -32,14 +33,15 @@ export function FlowChart({
   });
 
   const deviceToMfcId = (id) => {
-    if (id === "dev_01") return 0; // MFC-BL
-    if (id === "dev_02") return 1; // MFC-BK
-    return null;
+    const match = /^dev_(\d+)$/i.exec(String(id || "").trim());
+    if (!match) return null;
+    const idx = Number.parseInt(match[1], 10) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= MAX_MFC_DEVICES) return null;
+    return idx;
   };
-  const mfcIdToDevice = {
-    0: "dev_01", // MFC-BL
-    1: "dev_02", // MFC-BK
-  };
+  const mfcIdToDevice = Object.fromEntries(
+    Array.from({ length: MAX_MFC_DEVICES }, (_, idx) => [idx, `dev_${String(idx + 1).padStart(2, "0")}`]),
+  );
 
   const STORAGE_KEY = "flowchart_buffer";
 
@@ -55,17 +57,20 @@ export function FlowChart({
 
   useEffect(() => {
     const now = Date.now();
-    const initial = Array.from({ length: 12 }, (_, i) => ({
-      time: new Date(now - (12 - i) * 5000).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-      timestamp: now - (12 - i) * 5000,
-      flow_mfc0: 0,
-      setpoint_mfc0: 0,
-      flow_mfc1: 0,
-      setpoint_mfc1: 0,
-    }));
+    const initial = Array.from({ length: 12 }, (_, i) => {
+      const point = {
+        time: new Date(now - (12 - i) * 5000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        timestamp: now - (12 - i) * 5000,
+      };
+      for (let idx = 0; idx < MAX_MFC_DEVICES; idx++) {
+        point[`flow_mfc${idx}`] = 0;
+        point[`setpoint_mfc${idx}`] = 0;
+      }
+      return point;
+    });
 
     try {
       if (typeof window !== "undefined" && window.localStorage) {
@@ -87,33 +92,16 @@ export function FlowChart({
       const curMfc = deviceToMfcId(deviceId);
       const mapped = initial.map((pt, idx) => {
         const src = initialData[idx] || {};
-        return {
-          ...pt,
-          flow_mfc0:
-            curMfc === 0
-              ? Number.isFinite(Number(src.flow))
-                ? Number(src.flow)
-                : 0
-              : 0,
-          setpoint_mfc0:
-            curMfc === 0
-              ? Number.isFinite(Number(src.setpoint))
-                ? Number(src.setpoint)
-                : 0
-              : 0,
-          flow_mfc1:
-            curMfc === 1
-              ? Number.isFinite(Number(src.flow))
-                ? Number(src.flow)
-                : 0
-              : 0,
-          setpoint_mfc1:
-            curMfc === 1
-              ? Number.isFinite(Number(src.setpoint))
-                ? Number(src.setpoint)
-                : 0
-              : 0,
-        };
+        const out = { ...pt };
+        if (curMfc !== null) {
+          out[`flow_mfc${curMfc}`] = Number.isFinite(Number(src.flow))
+            ? Number(src.flow)
+            : 0;
+          out[`setpoint_mfc${curMfc}`] = Number.isFinite(Number(src.setpoint))
+            ? Number(src.setpoint)
+            : 0;
+        }
+        return out;
       });
       setData(mapped);
       try {
@@ -137,25 +125,15 @@ export function FlowChart({
         for (let i = 0; i < Math.min(next.length, initialData.length); i++) {
           const src = initialData[i];
           const cur = next[i] || {};
-          if (curMfc === 0) {
+          if (curMfc !== null) {
             next[i] = {
               ...cur,
-              flow_mfc0: Number.isFinite(Number(src.flow))
+              [`flow_mfc${curMfc}`]: Number.isFinite(Number(src.flow))
                 ? Number(src.flow)
-                : cur.flow_mfc0 || 0,
-              setpoint_mfc0: Number.isFinite(Number(src.setpoint))
+                : cur[`flow_mfc${curMfc}`] || 0,
+              [`setpoint_mfc${curMfc}`]: Number.isFinite(Number(src.setpoint))
                 ? Number(src.setpoint)
-                : cur.setpoint_mfc0 || 0,
-            };
-          } else if (curMfc === 1) {
-            next[i] = {
-              ...cur,
-              flow_mfc1: Number.isFinite(Number(src.flow))
-                ? Number(src.flow)
-                : cur.flow_mfc1 || 0,
-              setpoint_mfc1: Number.isFinite(Number(src.setpoint))
-                ? Number(src.setpoint)
-                : cur.setpoint_mfc1 || 0,
+                : cur[`setpoint_mfc${curMfc}`] || 0,
             };
           }
         }
@@ -185,17 +163,14 @@ export function FlowChart({
                 minute: "2-digit",
               }),
               timestamp: ts,
-              flow_mfc0: last.flow_mfc0 || 0,
-              setpoint_mfc0: last.setpoint_mfc0 || 0,
-              flow_mfc1: last.flow_mfc1 || 0,
-              setpoint_mfc1: last.setpoint_mfc1 || 0,
             };
-            if (uplinkMfc === 0) {
-              newPoint.flow_mfc0 = Number.isFinite(flow) ? flow : 0;
-              newPoint.setpoint_mfc0 = Number.isFinite(setpoint) ? setpoint : 0;
-            } else if (uplinkMfc === 1) {
-              newPoint.flow_mfc1 = Number.isFinite(flow) ? flow : 0;
-              newPoint.setpoint_mfc1 = Number.isFinite(setpoint) ? setpoint : 0;
+            for (let idx = 0; idx < MAX_MFC_DEVICES; idx++) {
+              newPoint[`flow_mfc${idx}`] = last[`flow_mfc${idx}`] || 0;
+              newPoint[`setpoint_mfc${idx}`] = last[`setpoint_mfc${idx}`] || 0;
+            }
+            if (Number.isInteger(uplinkMfc) && uplinkMfc >= 0 && uplinkMfc < MAX_MFC_DEVICES) {
+              newPoint[`flow_mfc${uplinkMfc}`] = Number.isFinite(flow) ? flow : 0;
+              newPoint[`setpoint_mfc${uplinkMfc}`] = Number.isFinite(setpoint) ? setpoint : 0;
             }
             const next = [...prev.slice(1), newPoint];
             try {
@@ -239,33 +214,23 @@ export function FlowChart({
                     minute: "2-digit",
                   }),
                   timestamp: ts,
-                  flow_mfc0: last.flow_mfc0 || 0,
-                  setpoint_mfc0: last.setpoint_mfc0 || 0,
-                  flow_mfc1: last.flow_mfc1 || 0,
-                  setpoint_mfc1: last.setpoint_mfc1 || 0,
                 };
-                const res0 = results[0];
-                const res1 = results[1];
-                if (res0) {
-                  const fv = parseFloat(res0.flow);
-                  const sv = parseFloat(res0.setpoint);
-                  newPoint.flow_mfc0 = Number.isFinite(fv)
-                    ? fv
-                    : newPoint.flow_mfc0;
-                  newPoint.setpoint_mfc0 = Number.isFinite(sv)
-                    ? sv
-                    : newPoint.setpoint_mfc0;
+                for (let idx = 0; idx < MAX_MFC_DEVICES; idx++) {
+                  newPoint[`flow_mfc${idx}`] = last[`flow_mfc${idx}`] || 0;
+                  newPoint[`setpoint_mfc${idx}`] = last[`setpoint_mfc${idx}`] || 0;
                 }
-                if (res1) {
-                  const fv = parseFloat(res1.flow);
-                  const sv = parseFloat(res1.setpoint);
-                  newPoint.flow_mfc1 = Number.isFinite(fv)
+                results.forEach((res, idx) => {
+                  if (!res || idx < 0 || idx >= MAX_MFC_DEVICES) return;
+                  const fv = parseFloat(res.flow);
+                  const sv = parseFloat(res.setpoint);
+                  newPoint[`flow_mfc${idx}`] = Number.isFinite(fv)
                     ? fv
-                    : newPoint.flow_mfc1;
-                  newPoint.setpoint_mfc1 = Number.isFinite(sv)
+                    : newPoint[`flow_mfc${idx}`];
+                  newPoint[`setpoint_mfc${idx}`] = Number.isFinite(sv)
                     ? sv
-                    : newPoint.setpoint_mfc1;
-                }
+                    : newPoint[`setpoint_mfc${idx}`];
+                });
+
                 const next = [...prev.slice(1), newPoint];
                 try {
                   saveBuffer(next);

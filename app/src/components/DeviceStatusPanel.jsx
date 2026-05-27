@@ -81,7 +81,7 @@ export function DeviceStatusPanel({
         <div className="flex items-center gap-3">
           <div className="flex flex-col gap-1">
             <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded font-mono text-base tracking-tight">
-              {device?.calibrationFound === false ? "MFC-XXXXX" : device?.name || "Unknown"}
+              {device?.calibrationFound === false ? `MFC-${device?.serial || "XXXXX"}` : device?.name || "Unknown"}
             </span>
             <span className="text-xs text-slate-500 font-mono">
               Serial: {device?.serial || "Unknown"}

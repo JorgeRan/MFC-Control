@@ -18,7 +18,7 @@ from socketio import AsyncServer, ASGIApp
 from shared_resources import get_bus, get_instrument, close_all, serial_bus_lock
 from calibration_loader import CalibrationLoader, Calibration
 from LED_indicator import LEDController
-from socket_commands import send_gas_command
+from mfc_status_publisher import append_status_rows_to_csv, resolve_csv_timestamps
 
 led_ctrl = LEDController()
 
@@ -52,9 +52,14 @@ session_state = {"sessionActive": False, "selectedGases": {}, "updatedAt": None}
 calibration_loader = None
 ser = None
 status_update_task = None
+logging_task = None
 connected_clients = set()
 STATUS_UPDATE_INTERVAL_SECONDS = 30
+LOG_INTERVAL_SECONDS = 1.0
 DISCOVERY_RETRY_SECONDS = 5
+MAX_MFC_DEVICES = 6
+DISCOVERY_SCAN_ATTEMPTS = 6
+DISCOVERY_SCAN_PAUSE_SECONDS = 0.2
 DEVICE_STALE_MISS_THRESHOLD = 12
 SERIAL_LOCK_TIMEOUT_SECONDS = 8.0
 SERIAL_LOCK_TIMEOUT_DISCOVERY_SECONDS = 10.0
@@ -116,7 +121,20 @@ def _device_id_to_mfc_index(device_id: str) -> Optional[int]:
         if not device_id:
             return None
         if device_id.startswith("dev_"):
-            return int(device_id.split("_")[1]) - 1
+            idx = int(device_id.split("_")[1]) - 1
+            if 0 <= idx < MAX_MFC_DEVICES:
+                return idx
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _mfc_index_to_device_id(mfc_index: int) -> Optional[str]:
+    try:
+        idx = int(mfc_index)
+        if 0 <= idx < MAX_MFC_DEVICES:
+            return f"dev_{idx + 1:02d}"
         return None
     except Exception:
         return None
@@ -130,27 +148,90 @@ def _gas_name_to_code(gas_name: str) -> Optional[int]:
 
 
 def _sync_selected_gases_to_logger(selected_gases: dict):
-    """Push API session gas selections into mfc_status_publisher process."""
-    if not isinstance(selected_gases, dict):
-        return
-
-    for device_id, gas_name in selected_gases.items():
-        mfc_index = _device_id_to_mfc_index(str(device_id))
-        gas_code = _gas_name_to_code(str(gas_name))
-        if mfc_index is None or gas_code is None:
-            continue
-        response = send_gas_command(mfc_index, gas_code, timeout=2.0)
-        if not response.get("success"):
-            print(
-                f"[gas-sync] Failed to sync gas for {device_id}: "
-                f"{response.get('message', 'unknown error')}"
-            )
+    """Preserved call site for local-only gas state in the API process."""
+    return
 
 
 async def _delayed_startup_gas_sync(delay_seconds: float = 2.0):
-    """Retry gas sync shortly after startup when logger socket is ready."""
+    """Retain startup sequencing for local gas state initialization."""
     await asyncio.sleep(delay_seconds)
     _sync_selected_gases_to_logger(session_state.get("selectedGases", {}))
+
+
+def _read_mfc_setpoint_raw(device_id: str) -> Optional[int]:
+    try:
+        device = mfc_devices.get(device_id)
+        if not device:
+            return None
+        inst = get_instrument(device["address"])
+        with serial_bus_lock(timeout=SERIAL_LOCK_TIMEOUT_SECONDS):
+            value = inst.readParameter(9)
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _csv_log_mfc_id(device: dict, device_id: str) -> str:
+    serial = str(device.get("serial", "")).strip()
+    calibration_mode = str(device.get("calibrationMode", "")).strip().upper()
+    calibration_found = bool(device.get("calibrationFound", False))
+
+    if calibration_mode != "FOUND" or not calibration_found:
+        return serial or str(device_id)
+
+    name_value = str(device.get("name", "")).strip()
+    if name_value.startswith("MFC-"):
+        short_code = name_value[4:].strip()
+        if short_code:
+            return short_code
+
+    return serial or str(device_id)
+
+
+def _build_logging_rows() -> list[dict]:
+    rows = []
+    selected_gases = session_state.get("selectedGases", {}) if isinstance(session_state, dict) else {}
+
+    for device_id in list(mfc_devices.keys()):
+        status = read_mfc_status(device_id)
+        device = mfc_devices.get(device_id, {})
+        setpoint_raw = _read_mfc_setpoint_raw(device_id)
+        gas_name = selected_gases.get(device_id, "UNKNOWN")
+        log_mfc_id = _csv_log_mfc_id(device, device_id)
+
+        rows.append({
+            "id": log_mfc_id,
+            "name": device.get("name"),
+            "serial": device.get("serial"),
+            "address": device.get("address"),
+            "gas": gas_name,
+            "setpoint": device.get("lastSetpoint"),
+            "flow": status.get("flow", device.get("lastFlow")),
+            "setpoint_raw": setpoint_raw,
+            "flow_raw": status.get("flowRaw"),
+            "calibration_status": device.get("calibrationMode", "FOUND"),
+        })
+
+    return rows
+
+
+def log_status_snapshot():
+    rows = _build_logging_rows()
+    timestamp_utc, timestamp_local, gps_coords = resolve_csv_timestamps(datetime.now().isoformat())
+    append_status_rows_to_csv(timestamp_utc, timestamp_local, rows, gps_coords)
+
+
+async def logging_loop():
+    while True:
+        try:
+            if mfc_devices:
+                log_status_snapshot()
+            await asyncio.sleep(LOG_INTERVAL_SECONDS)
+        except Exception as e:
+            print(f"[logging-loop] Error: {e}")
+            await asyncio.sleep(LOG_INTERVAL_SECONDS)
 
 
 def _check_gps_fix() -> bool:
@@ -306,17 +387,98 @@ def load_mfc_name_map_from_calibration(cal_file: Path) -> dict[str, str]:
     return name_map
 
 
+def _normalize_bus_nodes(raw_nodes) -> list[dict]:
+    """Deduplicate and stabilize raw bus node discovery results.
+
+    ProPar discovery can occasionally return duplicate entries for the same
+    physical device during transient bus noise. We collapse duplicates by
+    serial/address and sort by address so device IDs remain stable.
+    """
+    normalized: list[dict] = []
+    seen_keys = set()
+
+    for node in raw_nodes or []:
+        if not isinstance(node, dict):
+            continue
+
+        address = node.get("address")
+        serial_num = str(node.get("serial", "")).split("\x00")[0].strip()
+        dedupe_key = serial_num or f"addr:{address}"
+
+        if dedupe_key in seen_keys:
+            print(
+                f"[MFC] Ignoring duplicate bus node: address={address}, serial={serial_num or 'UNKNOWN'}",
+                flush=True,
+            )
+            continue
+
+        seen_keys.add(dedupe_key)
+        normalized.append({
+            **node,
+            "serial": serial_num,
+        })
+
+    normalized.sort(key=lambda node: (
+        int(node.get("address", 10**9)) if str(node.get("address", "")).isdigit() else 10**9,
+        str(node.get("serial", "")),
+    ))
+    return normalized
+
+
+def _scan_bus_nodes() -> list[dict]:
+    """Run several discovery scans and merge unique results.
+
+    A single `get_nodes()` call is not reliable on this bus. Different scans can
+    surface different subsets of the attached controllers, so we merge several
+    attempts into one stable inventory snapshot.
+    """
+    bus = get_bus()
+    merged_by_key: dict[str, dict] = {}
+    best_scan: list[dict] = []
+
+    for attempt in range(DISCOVERY_SCAN_ATTEMPTS):
+        try:
+            with serial_bus_lock(timeout=SERIAL_LOCK_TIMEOUT_DISCOVERY_SECONDS):
+                nodes = _normalize_bus_nodes(bus.master.get_nodes() or [])
+        except Exception as e:
+            print(f"[MFC] Discovery scan {attempt + 1}/{DISCOVERY_SCAN_ATTEMPTS} failed: {e}")
+            nodes = []
+
+        if len(nodes) > len(best_scan):
+            best_scan = list(nodes)
+
+        for node in nodes:
+            serial_key = str(node.get("serial", "")).strip()
+            address = node.get("address")
+            dedupe_key = serial_key or f"addr:{address}"
+            merged_by_key.setdefault(dedupe_key, node)
+
+        if len(merged_by_key) >= MAX_MFC_DEVICES:
+            break
+
+        if attempt < DISCOVERY_SCAN_ATTEMPTS - 1:
+            time.sleep(DISCOVERY_SCAN_PAUSE_SECONDS)
+
+    merged_nodes = list(merged_by_key.values()) if merged_by_key else best_scan
+    merged_nodes = _normalize_bus_nodes(merged_nodes)
+
+    if len(merged_nodes) > len(best_scan):
+        print(
+            f"[MFC] Discovery merged {len(merged_nodes)} unique nodes across {DISCOVERY_SCAN_ATTEMPTS} scans",
+            flush=True,
+        )
+
+    return merged_nodes
+
+
 
 def discover_mfc_devices():
     """Discover connected MFC devices"""
-    global mfc_devices, ser
+    global mfc_devices
     try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        print("[MFC] Serial port opened")
+        print("[MFC] Starting device discovery")
         
-        bus = get_bus()
-        with serial_bus_lock(timeout=SERIAL_LOCK_TIMEOUT_DISCOVERY_SECONDS):
-            nodes = bus.master.get_nodes()
+        nodes = _scan_bus_nodes()
         
         if not nodes:
             print("[MFC] No MFC nodes found")
@@ -324,10 +486,15 @@ def discover_mfc_devices():
         
         name_map = load_mfc_name_map_from_calibration(CAL_FILE)
         devices = {}
-        for i, node in enumerate(nodes):
+        if len(nodes) > MAX_MFC_DEVICES:
+            print(
+                f"[MFC] Found {len(nodes)} nodes; limiting to first {MAX_MFC_DEVICES}",
+                flush=True,
+            )
+
+        for i, node in enumerate(nodes[:MAX_MFC_DEVICES]):
             address = node["address"]
-            serial_num = node["serial"]
-            serial_key = serial_num.split("\x00")[0]
+            serial_key = str(node["serial"]).strip()
             
             device_id = f"dev_{i + 1:02d}"
             short_code = name_map.get(serial_key)
@@ -378,21 +545,24 @@ def sync_devices_from_bus() -> dict:
     }
 
     try:
-        bus = get_bus()
-        with serial_bus_lock(timeout=SERIAL_LOCK_TIMEOUT_DISCOVERY_SECONDS):
-            nodes = bus.master.get_nodes() or []
+        nodes = _scan_bus_nodes()
         name_map = load_mfc_name_map_from_calibration(CAL_FILE)
 
         latest_ids = set()
 
-        for i, node in enumerate(nodes):
+        if len(nodes) > MAX_MFC_DEVICES:
+            print(
+                f"[MFC] Sync found {len(nodes)} nodes; limiting to first {MAX_MFC_DEVICES}",
+                flush=True,
+            )
+
+        for i, node in enumerate(nodes[:MAX_MFC_DEVICES]):
             device_id = f"dev_{i + 1:02d}"
             latest_ids.add(device_id)
             device_absence_counts[device_id] = 0
 
             address = node["address"]
-            serial_num = node["serial"]
-            serial_key = str(serial_num).split("\x00")[0].strip()
+            serial_key = str(node["serial"]).strip()
 
             short_code = name_map.get(serial_key)
             if short_code:
@@ -666,15 +836,13 @@ async def update_status_loop():
                 device = mfc_devices.get(device_id, {})
                 if status.get("status") == "online":
                     any_online = True
-                mfc_id = 0 if device_id == "dev_01" else 1 if device_id == "dev_02" else None
+                mfc_id = _device_id_to_mfc_index(device_id)
 
-                # Emit native status payload.
                 await sio.emit("device_status", {
                     "device_id": device_id,
                     "data": status
-                }, skip_sid=[])  # Send to all
+                }, skip_sid=[])  
 
-                # Emit legacy uplink payload expected by the existing frontend.
                 await sio.emit("uplink", {
                     "type": "status",
                     "deviceId": device_id,
@@ -688,8 +856,7 @@ async def update_status_loop():
                     "timestamp": status.get("timestamp", datetime.now().isoformat()),
                 }, skip_sid=[])
 
-            # Keep device inventory synced even when at least one device is online.
-            # This allows missing devices to be re-added after transient startup/bus issues.
+          
             sync_summary = sync_devices_from_bus()
             if sync_summary.get("changed"):
                 await emit_state_sync()
@@ -722,6 +889,13 @@ def start_status_loop():
     loop.run_until_complete(update_status_loop())
 
 
+def start_logging_loop():
+    """Start CSV logging in-process so the API is the only serial-bus owner."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(logging_loop())
+
+
 async def emit_flow_after_setpoint(device_id: str, mfc_id: int, delay_s: float = 3.0):
     """Wait `delay_s` seconds then read actual flow and push to all clients."""
     await asyncio.sleep(delay_s)
@@ -750,12 +924,71 @@ async def emit_flow_after_setpoint(device_id: str, mfc_id: int, delay_s: float =
         print(f"[MFC] Post-setpoint readback failed for {device_id}: {e}")
 
 
+def _resolve_device_id_for_gas_lookup(device_name: str) -> Optional[str]:
+    lookup = str(device_name).strip().upper()
+    if not lookup:
+        return None
+
+    alias_to_device_id = {}
+    for dev_id, dev_data in mfc_devices.items():
+        normalized_dev_id = str(dev_id).upper()
+        normalized_name = str(dev_data.get("name", "")).strip().upper()
+        name_suffix = normalized_name.replace("MFC-", "") if normalized_name else ""
+
+        candidates = {normalized_dev_id}
+        if normalized_name:
+            candidates.add(normalized_name)
+        if name_suffix:
+            candidates.add(name_suffix)
+
+        mfc_idx = _device_id_to_mfc_index(str(dev_id))
+        if mfc_idx is not None:
+            # Support A/B/C... shorthand aliases.
+            candidates.add(chr(65 + mfc_idx))
+
+        for candidate in candidates:
+            alias_to_device_id.setdefault(candidate, dev_id)
+
+    if lookup in alias_to_device_id:
+        return alias_to_device_id[lookup]
+
+    for alias, dev_id in alias_to_device_id.items():
+        if lookup in alias:
+            return dev_id
+
+    return None
+
+
+async def _setpoint_for_device_id(device_id: str, value: float):
+    if device_id not in mfc_devices:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+
+    mfc_id = _device_id_to_mfc_index(device_id)
+    if mfc_id is None:
+        raise HTTPException(status_code=400, detail=f"Invalid device ID {device_id}")
+
+    result = set_mfc_setpoint(device_id, value)
+    await sio.emit("setpoint_updated", {"device_id": device_id, "value": value}, skip_sid=[])
+    await sio.emit("uplink", {
+        "type": "status",
+        "deviceId": device_id,
+        "mfcId": mfc_id,
+        "device": str(mfc_devices.get(device_id, {}).get("name", f"MFC-{mfc_id + 1}")).replace("MFC-", ""),
+        "flow": mfc_devices.get(device_id, {}).get("lastFlow", 0),
+        "setpoint": mfc_devices.get(device_id, {}).get("lastSetpoint", value),
+        "timestamp": datetime.now().isoformat(),
+    }, skip_sid=[])
+    await emit_state_sync()
+    asyncio.create_task(emit_flow_after_setpoint(device_id, mfc_id))
+    return result
+
+
 # ==================== REST API Endpoints ====================
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
-    global mfc_devices, calibration_loader, status_update_task
+    global mfc_devices, calibration_loader, status_update_task, logging_task
     
     # Load calibrations
     try:
@@ -785,6 +1018,13 @@ async def startup_event():
     )
     status_update_task.start()
     print("[API] Status update loop started")
+
+    logging_task = threading.Thread(
+        target=start_logging_loop,
+        daemon=True
+    )
+    logging_task.start()
+    print("[API] CSV logging loop started")
     
     print("[API] Server started successfully")
 
@@ -876,18 +1116,7 @@ async def set_selected_gas(body: dict):
     
     session_state["selectedGases"][device_id] = gas
     save_session_state()
-
-    mfc_index = _device_id_to_mfc_index(str(device_id))
-    gas_code = _gas_name_to_code(str(gas))
-    if mfc_index is not None and gas_code is not None:
-        response = send_gas_command(mfc_index, gas_code, timeout=2.0)
-        if not response.get("success"):
-            print(
-                f"[gas-sync] Failed to push selected gas for {device_id}: "
-                f"{response.get('message', 'unknown error')}"
-            )
-    else:
-        print(f"[gas-sync] Invalid gas selection payload: device_id={device_id}, gas={gas}")
+    _sync_selected_gases_to_logger(session_state.get("selectedGases", {}))
     
     await sio.emit("gas_selected", {
         "deviceId": device_id,
@@ -922,30 +1151,8 @@ async def get_device_metrics(device_id: str):
 async def fetch_device_gases(device_name: str):
     """Fetch available gases for a device based on its serial number"""
     try:
-        # Find device by name or short alias used by the frontend.
-        lookup = device_name.strip().upper()
-        aliases = {
-            "A": {"dev_01", "MFC-A", "MFC-BL", "BL"},
-            "BL": {"dev_01", "MFC-A", "MFC-BL", "BL"},
-            "B": {"dev_02", "MFC-B", "MFC-BK", "BK"},
-            "BK": {"dev_02", "MFC-B", "MFC-BK", "BK"},
-        }
-
-        device_id = None
-        for dev_id, dev_data in mfc_devices.items():
-            device_name_value = str(dev_data.get("name", "")).upper()
-            candidates = {dev_id.upper(), device_name_value}
-            candidates.update(aliases.get(lookup, set()))
-
-            if (
-                lookup == dev_id.upper()
-                or lookup == device_name_value
-                or lookup in device_name_value
-                or device_name_value in aliases.get(lookup, set())
-                or dev_id.upper() in aliases.get(lookup, set())
-            ):
-                device_id = dev_id
-                break
+        # Find device by ID, full name, short name, or A/B/C... alias.
+        device_id = _resolve_device_id_for_gas_lookup(device_name)
         
         if not device_id:
             raise HTTPException(status_code=404, detail=f"Device {device_name} not found")
@@ -980,62 +1187,44 @@ async def get_device_logs(device_id: str):
     }
 
 
-@app.post("/setpoint-0")
-async def set_setpoint_0(body: dict):
-    """Set setpoint for MFC ID 0 (dev_01 / MFC-BL)."""
+@app.post("/setpoint-{mfc_id}")
+async def set_setpoint_by_mfc_id(mfc_id: int, body: dict):
+    """Set setpoint by MFC index, e.g. /setpoint-0 ... /setpoint-5."""
     value = body.get("value")
     if value is None:
         raise HTTPException(status_code=400, detail="Missing value")
-    
-    result = set_mfc_setpoint("dev_01", value)
-    await sio.emit("setpoint_updated", {"device_id": "dev_01", "value": value}, skip_sid=[])
-    await sio.emit("uplink", {
-        "type": "status",
-        "deviceId": "dev_01",
-        "mfcId": 0,
-        "device": str(mfc_devices.get("dev_01", {}).get("name", "BL")).replace("MFC-", ""),
-        "flow": mfc_devices.get("dev_01", {}).get("lastFlow", 0),
-        "setpoint": mfc_devices.get("dev_01", {}).get("lastSetpoint", value),
-        "timestamp": datetime.now().isoformat(),
-    }, skip_sid=[])
-    await emit_state_sync()
-    asyncio.create_task(emit_flow_after_setpoint("dev_01", 0))
-    return result
+
+    try:
+        numeric_value = float(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid value {value}")
+
+    device_id = _mfc_index_to_device_id(mfc_id)
+    if device_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid MFC ID {mfc_id}. Supported range: 0-{MAX_MFC_DEVICES - 1}",
+        )
+
+    return await _setpoint_for_device_id(device_id, numeric_value)
 
 
-@app.post("/setpoint-1")
-async def set_setpoint_1(body: dict):
-    """Set setpoint for MFC ID 1 (dev_02 / MFC-BK)."""
-    value = body.get("value")
-    if value is None:
-        raise HTTPException(status_code=400, detail="Missing value")
-    
-    result = set_mfc_setpoint("dev_02", value)
-    await sio.emit("setpoint_updated", {"device_id": "dev_02", "value": value}, skip_sid=[])
-    await sio.emit("uplink", {
-        "type": "status",
-        "deviceId": "dev_02",
-        "mfcId": 1,
-        "device": str(mfc_devices.get("dev_02", {}).get("name", "BK")).replace("MFC-", ""),
-        "flow": mfc_devices.get("dev_02", {}).get("lastFlow", 0),
-        "setpoint": mfc_devices.get("dev_02", {}).get("lastSetpoint", value),
-        "timestamp": datetime.now().isoformat(),
-    }, skip_sid=[])
-    await emit_state_sync()
-    asyncio.create_task(emit_flow_after_setpoint("dev_02", 1))
-    return result
+@app.post("/send-command-{mfc_id}")
+async def send_command_by_mfc_id(mfc_id: int, body: dict):
+    """Send command by MFC index, e.g. /send-command-0 ... /send-command-5."""
+    device_id = _mfc_index_to_device_id(mfc_id)
+    if device_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid MFC ID {mfc_id}. Supported range: 0-{MAX_MFC_DEVICES - 1}",
+        )
 
-
-@app.post("/send-command-0")
-async def send_command_mfc_0(body: dict):
-    """Send command to MFC ID 0 (placeholder)."""
-    return {"status": "success", "device": "dev_01", "command": body.get("command")}
-
-
-@app.post("/send-command-1")
-async def send_command_mfc_1(body: dict):
-    """Send command to MFC ID 1 (placeholder)."""
-    return {"status": "success", "device": "dev_02", "command": body.get("command")}
+    return {
+        "status": "success",
+        "device": device_id,
+        "mfcId": mfc_id,
+        "command": body.get("command"),
+    }
 
 
 @app.post("/refresh")

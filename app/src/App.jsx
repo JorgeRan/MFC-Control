@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { DeviceStatusPanel } from "./components/DeviceStatusPanel";
 import { LogTable } from "./components/LogTable";
 import { FlowChart } from "./components/FlowChart";
@@ -16,7 +16,7 @@ import {
   saveSelectedGas,
 } from "./services/api";
 
-const PRIMARY_DEVICE_IDS = ["dev_01", "dev_02"];
+const PRIMARY_DEVICE_IDS = ["dev_01", "dev_02", "dev_03", "dev_04", "dev_05", "dev_06"];
 
 function filterNodesToPrimaryDevices(nodes) {
   if (!Array.isArray(nodes)) return [];
@@ -68,6 +68,30 @@ const MOCK_METRICS = {
     lastSeen: "2 mins ago",
   },
   dev_02: {
+    signal: -65,
+    battery: 100,
+    uptime: "45d 12h",
+    lastSeen: "Just now",
+  },
+  dev_03: {
+    signal: -65,
+    battery: 100,
+    uptime: "45d 12h",
+    lastSeen: "Just now",
+  },
+  dev_04: {
+    signal: -65,
+    battery: 100,
+    uptime: "45d 12h",
+    lastSeen: "Just now",
+  },
+  dev_05: {
+    signal: -65,
+    battery: 100,
+    uptime: "45d 12h",
+    lastSeen: "Just now",
+  },
+  dev_06: {
     signal: -65,
     battery: 100,
     uptime: "45d 12h",
@@ -129,22 +153,18 @@ export function App() {
   const [refreshMessage, setRefreshMessage] = useState("");
 
   const mfcIdToDeviceId = (mfcId) => {
-    if (Number(mfcId) === 0) return "dev_01";
-    if (Number(mfcId) === 1) return "dev_02";
-    return null;
+    const idx = Number(mfcId);
+    if (!Number.isInteger(idx) || idx < 0 || idx > 5) return null;
+    return `dev_${String(idx + 1).padStart(2, "0")}`;
   };
-  
-  const DEVICE_SENSORS = {
-    dev_01: [
-      { id: "mfc1", label: "MFC-BL" },
-      { id: "mfc0", label: "MFC-BK" },
-    ],
-    dev_02: [
-      { id: "test_mfc1", label: "Test MFC-1" },
-      { id: "test_mfc2", label: "Test MFC-2" },
-      { id: "test_mfc3", label: "Test MFC-3" },
-    ],
-  };
+
+  const DEVICE_SENSORS = useMemo(() => {
+    const map = {};
+    PRIMARY_DEVICE_IDS.forEach((deviceId, idx) => {
+      map[deviceId] = [{ id: `mfc${idx}`, label: `MFC-${idx + 1}` }];
+    });
+    return map;
+  }, []);
   function useLiveNodeUpdates(nodes, setNodes, socket) {
     useEffect(() => {
       if (!socket) return;
